@@ -10,12 +10,13 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
+# Cache global para resolver vanity URLs
+vanity_cache = {}
 
-def extraer_steamid(entrada):
+def extract_steamid(entry):
     """
     Detecta automáticamente si el usuario ingresó:
     - SteamID numérico
@@ -24,68 +25,58 @@ def extraer_steamid(entrada):
     - Alias directo
     """
 
-    if not entrada:
+    if not entry:
         logging.error("Entrada vacía")
         return None
 
-    entrada = str(entrada).strip()
+    entry = str(entry).strip()
 
     # 1️⃣ SteamID64 directo
-    if entrada.isdigit() and len(entrada) == 17:
+    if entry.isdigit() and len(entry) == 17:
         logging.info("SteamID numérico detectado")
-        return entrada
+        return entry
 
     # 2️⃣ URL tipo /profiles/
-    match_profile = re.search(r"/profiles/(\d+)", entrada)
+    match_profile = re.search(r"/profiles/(\d+)", entry)
     if match_profile:
         logging.info("URL con SteamID detectada")
         return match_profile.group(1)
 
     # 3️⃣ URL tipo /id/alias
-    match_vanity = re.search(r"/id/([^/?]+)", entrada)
+    match_vanity = re.search(r"/id/([^/?]+)", entry)
     if match_vanity:
         vanity = match_vanity.group(1).lower()
-
         if len(vanity) < 3:
             logging.error("Alias demasiado corto")
             return None
-
         logging.info(f"Alias detectado en URL: {vanity}")
-        return resolver_vanity(vanity)
+        return resolve_vanity(vanity)
 
-    if "/" not in entrada:
-
-        alias = entrada.lower()
-
+    # Alias directo
+    if "/" not in entry:
+        alias = entry.lower()
         if len(alias) < 3:
             logging.error("Alias demasiado corto")
             return None
-
         logging.info(f"Alias directo detectado: {alias}")
-        return resolver_vanity(alias)
+        return resolve_vanity(alias)
 
     logging.error("No se pudo interpretar la entrada")
     return None
 
 
-
-cache_vanity = {}
-
-def resolver_vanity(vanity):
+def resolve_vanity(vanity):
     """
     Convierte un alias de Steam a SteamID64 usando la API.
     Usa cache para evitar llamadas repetidas.
     """
-
     vanity = vanity.lower()
 
-    # comprobar cache
-    if vanity in cache_vanity:
+    if vanity in vanity_cache:
         logging.info("Alias encontrado en cache")
-        return cache_vanity[vanity]
+        return vanity_cache[vanity]
 
     url = "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/"
-
     params = {
         "key": API_KEY,
         "vanityurl": vanity
@@ -93,7 +84,6 @@ def resolver_vanity(vanity):
 
     try:
         logging.info(f"Resolviendo alias: {vanity}")
-
         response = requests.get(url, params=params, timeout=10)
 
         if response.status_code != 200:
@@ -101,20 +91,14 @@ def resolver_vanity(vanity):
             return None
 
         data = response.json()
-
         if "response" not in data:
             logging.error("Respuesta inválida de Steam")
             return None
 
         if data["response"].get("success") == 1:
-
             steamid = data["response"].get("steamid")
-
             logging.info(f"Alias resuelto: {steamid}")
-
-            # guardar en cache
-            cache_vanity[vanity] = steamid
-
+            vanity_cache[vanity] = steamid
             return steamid
 
         logging.error("Alias no encontrado o inválido")
@@ -131,14 +115,15 @@ def resolver_vanity(vanity):
     except Exception as e:
         logging.error(f"Error inesperado: {e}")
         return None
-        
-    
-def obtener_juegos_usuario(steamid):
 
+
+def get_user_games(steamid):
+    """
+    Consulta los juegos del usuario desde la API de Steam.
+    """
     logging.info(f"Consultando juegos del usuario {steamid}")
 
     url = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
-
     params = {
         "key": API_KEY,
         "steamid": steamid,
@@ -147,11 +132,8 @@ def obtener_juegos_usuario(steamid):
     }
 
     try:
-
         logging.info("Enviando petición a la API de Steam")
-
         response = requests.get(url, params=params, timeout=10)
-
         logging.info(f"Código de respuesta: {response.status_code}")
 
         if response.status_code != 200:
@@ -159,14 +141,10 @@ def obtener_juegos_usuario(steamid):
             return pd.DataFrame()
 
         data = response.json()
+        games = data.get("response", {}).get("games", [])
+        logging.info(f"Se encontraron {len(games)} juegos")
 
-        juegos = data.get("response", {}).get("games", [])
-
-        logging.info(f"Se encontraron {len(juegos)} juegos")
-
-        df = pd.DataFrame(juegos)
-
-        return df
+        return pd.DataFrame(games)
 
     except requests.exceptions.Timeout:
         logging.error("Tiempo de espera agotado al consultar juegos")
@@ -180,35 +158,32 @@ def obtener_juegos_usuario(steamid):
         logging.error(f"Error inesperado: {e}")
         return pd.DataFrame()
 
-def construir_perfil_usuario(df, juegos_usuario, min_minutos=120):
 
-    if juegos_usuario is None or juegos_usuario.empty:
+def build_user_profile(df, user_games, min_minutes=120):
+    """
+    Construye un perfil del usuario filtrando juegos por tiempo mínimo jugado.
+    """
+    if user_games is None or user_games.empty:
         logging.warning("El usuario no tiene juegos o el perfil es privado")
         return df.iloc[0:0]
 
-    # Filtrar juegos con al menos X minutos jugados
-    juegos_filtrados = juegos_usuario[
-        juegos_usuario["playtime_forever"] >= min_minutos
-    ]
+    # Filtrar juegos con al menos min_minutes
+    filtered_games = user_games[user_games["playtime_forever"] >= min_minutes]
+    logging.info(f"Juegos con al menos {min_minutes} minutos jugados: {len(filtered_games)}")
 
-    logging.info(f"Juegos con al menos {min_minutos} minutos jugados: {len(juegos_filtrados)}")
-
-    if juegos_filtrados.empty:
+    if filtered_games.empty:
         logging.warning("Ningún juego supera el mínimo de tiempo jugado")
         return df.iloc[0:0]
 
-    # Obtener appids
-    appids_usuario = set(juegos_filtrados["appid"].astype(str))
-
-    logging.info(f"AppIDs válidos: {len(appids_usuario)}")
+    user_appids = set(filtered_games["appid"].astype(str))
+    logging.info(f"AppIDs válidos: {len(user_appids)}")
 
     if "app_id" not in df.columns:
         logging.error("El DataFrame no contiene la columna 'app_id'")
         return df.iloc[0:0]
 
     # Filtrar dataset
-    juegos_df = df[df["app_id"].isin(appids_usuario)]
+    user_df = df[df["app_id"].isin(user_appids)]
+    logging.info(f"Juegos encontrados en dataset: {len(user_df)}")
 
-    logging.info(f"Juegos encontrados en dataset: {len(juegos_df)}")
-
-    return juegos_df
+    return user_df
